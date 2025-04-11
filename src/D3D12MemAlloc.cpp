@@ -1,5 +1,5 @@
 //
-// Copyright (c) 2019-2024 Advanced Micro Devices, Inc. All rights reserved.
+// Copyright (c) 2019-2025 Advanced Micro Devices, Inc. All rights reserved.
 //
 // Permission is hereby granted, free of charge, to any person obtaining a copy
 // of this software and associated documentation files (the "Software"), to deal
@@ -31,6 +31,13 @@
 #include <malloc.h> // for _aligned_malloc, _aligned_free
 #ifndef _WIN32
     #include <shared_mutex>
+#endif
+
+// Includes needed for MinGW - see #71.
+#ifndef _MSC_VER
+    #include <guiddef.h>
+    // guiddef.h must be included first.
+    #include <dxguids.h>
 #endif
 
 ////////////////////////////////////////////////////////////////////////////////
@@ -107,6 +114,14 @@ especially to test compatibility with D3D12_RESOURCE_HEAP_TIER_1 on modern GPUs.
    #define D3D12MA_DEFAULT_BLOCK_SIZE (64ull * 1024 * 1024)
 #endif
 
+#ifndef D3D12MA_OPTIONS16_SUPPORTED
+    #if D3D12_SDK_VERSION >= 610
+        #define D3D12MA_OPTIONS16_SUPPORTED 1
+    #else
+        #define D3D12MA_OPTIONS16_SUPPORTED 0
+    #endif
+#endif
+
 #ifndef D3D12MA_DEBUG_LOG
    #define D3D12MA_DEBUG_LOG(format, ...)
    /*
@@ -127,10 +142,6 @@ especially to test compatibility with D3D12_RESOURCE_HEAP_TIER_1 on modern GPUs.
 ////////////////////////////////////////////////////////////////////////////////
 
 #define D3D12MA_IID_PPV_ARGS(ppType)   __uuidof(**(ppType)), reinterpret_cast<void**>(ppType)
-
-#ifdef __ID3D12Device8_INTERFACE_DEFINED__
-    #define D3D12MA_CREATE_NOT_ZEROED_AVAILABLE 1
-#endif
 
 namespace D3D12MA
 {
@@ -2791,7 +2802,7 @@ class AllocationObjectAllocator
     D3D12MA_CLASS_NO_COPY(AllocationObjectAllocator);
 public:
     AllocationObjectAllocator(const ALLOCATION_CALLBACKS& allocationCallbacks, bool useMutex)
-        : m_Allocator(allocationCallbacks, 1024), m_UseMutex(useMutex) {}
+		: m_UseMutex(useMutex), m_Allocator(allocationCallbacks, 1024) {}
 
     template<typename... Types>
     Allocation* Allocate(Types... args);
@@ -5030,7 +5041,8 @@ void BlockMetadata_TLSF::WriteAllocationInfoToJson(JsonWriter& json) const
     }
     D3D12MA_ASSERT(i == 0);
 
-    PrintDetailedMap_Begin(json, GetSumFreeSize(), GetAllocationCount(), m_BlocksFreeCount + static_cast<bool>(m_NullBlock->size));
+    PrintDetailedMap_Begin(json, GetSumFreeSize(), GetAllocationCount(), m_BlocksFreeCount +
+        (m_NullBlock->size > 0 ? 1 : 0));
     for (; i < blockCount; ++i)
     {
         Block* block = blockList[i];
@@ -5846,6 +5858,7 @@ public:
 
     AllocatorPimpl* GetAllocator() const { return m_Allocator; }
     const POOL_DESC& GetDesc() const { return m_Desc; }
+    bool AlwaysCommitted() const { return (m_Desc.Flags & POOL_FLAG_ALWAYS_COMMITTED) != 0; }
     bool SupportsCommittedAllocations() const { return m_Desc.BlockSize == 0; }
     LPCWSTR GetName() const { return m_Name; }
 
@@ -6162,9 +6175,6 @@ HRESULT AllocatorPimpl::Init(const ALLOCATOR_DESC& desc)
     m_D3D12Options.ResourceHeapTier = (D3D12MA_FORCE_RESOURCE_HEAP_TIER);
 #endif
 
-// You must define this macro to like `#define D3D12MA_OPTIONS16_SUPPORTED 1` to enable GPU Upload Heaps!
-// Unfortunately there is no way to programmatically check if the included <d3d12.h> defines D3D12_FEATURE_DATA_D3D12_OPTIONS16 or not.
-// Main interfaces have respective macros like __ID3D12Device4_INTERFACE_DEFINED__, but structures like this do not.
 #if D3D12MA_OPTIONS16_SUPPORTED
     {
         D3D12_FEATURE_DATA_D3D12_OPTIONS16 options16 = {};
@@ -6174,7 +6184,7 @@ HRESULT AllocatorPimpl::Init(const ALLOCATOR_DESC& desc)
             m_GPUUploadHeapSupported = options16.GPUUploadHeapSupported;
         }
     }
-#endif
+#endif // #if D3D12MA_OPTIONS16_SUPPORTED
 
     hr = m_Device->CheckFeatureSupport(D3D12_FEATURE_ARCHITECTURE, &m_D3D12Architecture, sizeof(m_D3D12Architecture));
     if (FAILED(hr))
@@ -7395,8 +7405,8 @@ HRESULT AllocatorPimpl::CalcAllocationParams(const ALLOCATION_DESC& allocDesc, U
     outCommittedAllocationParams = CommittedAllocationParameters();
     outPreferCommitted = false;
 
-    D3D12MA_ASSERT((allocDesc.HeapType != D3D12_HEAP_TYPE_GPU_UPLOAD_COPY || IsGPUUploadHeapSupported()) &&
-        "Trying to allocate from D3D12_HEAP_TYPE_GPU_UPLOAD while GPUUploadHeapSupported == FALSE or D3D12MA_OPTIONS16_SUPPORTED macro was not defined when compiling D3D12MA library.");
+    if (allocDesc.HeapType == D3D12_HEAP_TYPE_GPU_UPLOAD_COPY && !IsGPUUploadHeapSupported())
+        return E_NOTIMPL;
 
     bool msaaAlwaysCommitted;
     if (allocDesc.CustomPool != NULL)
@@ -7404,7 +7414,8 @@ HRESULT AllocatorPimpl::CalcAllocationParams(const ALLOCATION_DESC& allocDesc, U
         PoolPimpl* const pool = allocDesc.CustomPool->m_Pimpl;
 
         msaaAlwaysCommitted = pool->GetBlockVector()->DeniesMsaaTextures();
-        outBlockVector = pool->GetBlockVector();
+        if(!pool->AlwaysCommitted())
+            outBlockVector = pool->GetBlockVector();
 
         const auto& desc = pool->GetDesc();
         outCommittedAllocationParams.m_ProtectedSession = desc.pProtectedSession;
@@ -7443,12 +7454,6 @@ HRESULT AllocatorPimpl::CalcAllocationParams(const ALLOCATION_DESC& allocDesc, U
                 outPreferCommitted = true;
             }
         }
-
-        const D3D12_HEAP_FLAGS extraHeapFlags = allocDesc.ExtraHeapFlags & ~RESOURCE_CLASS_HEAP_FLAGS;
-        if (outBlockVector != NULL && extraHeapFlags != 0)
-        {
-            outBlockVector = NULL;
-        }
     }
 
     if ((allocDesc.Flags & ALLOCATION_FLAG_COMMITTED) != 0 ||
@@ -7478,12 +7483,7 @@ UINT AllocatorPimpl::CalcDefaultPoolIndex(const ALLOCATION_DESC& allocDesc, Reso
     D3D12_HEAP_FLAGS extraHeapFlags = allocDesc.ExtraHeapFlags & ~RESOURCE_CLASS_HEAP_FLAGS;
 
 #if D3D12MA_CREATE_NOT_ZEROED_AVAILABLE
-    // If allocator was created with ALLOCATOR_FLAG_DEFAULT_POOLS_NOT_ZEROED, also ignore
-    // D3D12_HEAP_FLAG_CREATE_NOT_ZEROED.
-    if(m_DefaultPoolsNotZeroed)
-    {
-        extraHeapFlags &= ~D3D12_HEAP_FLAG_CREATE_NOT_ZEROED;
-    }
+    extraHeapFlags &= ~D3D12_HEAP_FLAG_CREATE_NOT_ZEROED;
 #endif
 
     if (extraHeapFlags != 0)
@@ -9312,11 +9312,6 @@ void Allocation::SetName(LPCWSTR Name)
 
 void Allocation::ReleaseThis()
 {
-    if (this == NULL)
-    {
-        return;
-    }
-
     SAFE_RELEASE(m_Resource);
 
     switch (m_PackedData.GetType())
@@ -9461,11 +9456,6 @@ void DefragmentationContext::GetStats(DEFRAGMENTATION_STATS* pStats)
 
 void DefragmentationContext::ReleaseThis()
 {
-    if (this == NULL)
-    {
-        return;
-    }
-
     D3D12MA_DELETE(m_Pimpl->GetAllocs(), this);
 }
 
@@ -9518,6 +9508,8 @@ HRESULT Pool::BeginDefragmentation(const DEFRAGMENTATION_DESC* pDesc, Defragment
     // Check for support
     if (m_Pimpl->GetBlockVector()->GetAlgorithm() & POOL_FLAG_ALGORITHM_LINEAR)
         return E_NOINTERFACE;
+    if(m_Pimpl->AlwaysCommitted())
+        return E_NOINTERFACE;
 
     AllocatorPimpl* allocator = m_Pimpl->GetAllocator();
     *ppContext = D3D12MA_NEW(allocator->GetAllocs(), DefragmentationContext)(allocator, *pDesc, m_Pimpl->GetBlockVector());
@@ -9526,11 +9518,6 @@ HRESULT Pool::BeginDefragmentation(const DEFRAGMENTATION_DESC* pDesc, Defragment
 
 void Pool::ReleaseThis()
 {
-    if (this == NULL)
-    {
-        return;
-    }
-
     D3D12MA_DELETE(m_Pimpl->GetAllocator()->GetAllocs(), this);
 }
 
@@ -9744,6 +9731,12 @@ HRESULT Allocator::CreatePool(
         (pPoolDesc->MinAllocationAlignment > 0 && !IsPow2(pPoolDesc->MinAllocationAlignment)))
     {
         D3D12MA_ASSERT(0 && "Invalid arguments passed to Allocator::CreatePool.");
+        return E_INVALIDARG;
+    }
+    if ((pPoolDesc->Flags & POOL_FLAG_ALWAYS_COMMITTED) != 0 &&
+        (pPoolDesc->BlockSize != 0 || pPoolDesc->MinBlockCount > 0))
+    {
+        D3D12MA_ASSERT(0 && "Invalid arguments passed to Allocator::CreatePool while POOL_FLAG_ALWAYS_COMMITTED is specified.");
         return E_INVALIDARG;
     }
     if (!m_Pimpl->HeapFlagsFulfillResourceHeapTier(pPoolDesc->HeapFlags))
